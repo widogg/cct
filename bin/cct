@@ -13,6 +13,23 @@ die() {
   exit 1
 }
 
+need() { # tools...: dies listing every missing one; fzf also needs >= 0.74 for transform/footer
+  local tool missing=()
+
+  for tool in "$@"; do
+    command -v "$tool" >/dev/null || missing+=("$tool")
+  done
+  ((${#missing[@]} == 0)) || die "missing required tools: ${missing[*]}"
+
+  if [[ " $* " == *' fzf '* ]]; then
+    local version
+    version=$(fzf --version | cut -d' ' -f1)
+    printf '%s\n' 0.74 "$version" \
+      | sort -VC \
+      || die "fzf >= 0.74 required, found $(fzf --version)"
+  fi
+}
+
 # Claude keys a project by its launch dir with every non-alnum char turned into '-'.
 key_of() {
   local dir=$1
@@ -273,7 +290,7 @@ crumb_of() { # transcript -> "root › … › parent › current", empty for a 
   echo "${joined% › }"
 }
 
-cmd_statusline() { # wraps oh-my-posh, passing the breadcrumb as $CCT_CRUMB
+cmd_statusline() { # wraps oh-my-posh, passing the breadcrumb as $CCT_CRUMB; plain text without it
   local input transcript_path
   input=$(cat)
   transcript_path=$(jq -r '.transcript_path // empty' <<<"$input" 2>/dev/null)
@@ -282,10 +299,17 @@ cmd_statusline() { # wraps oh-my-posh, passing the breadcrumb as $CCT_CRUMB
   [[ -f $transcript_path ]] && CCT_CRUMB=$(crumb_of "$transcript_path")
   export CCT_CRUMB
 
-  # sed drops the terminal-title escape
-  printf '%s' "$input" \
-    | oh-my-posh claude --config "$OMP_CONFIG" \
-    | sed -E 's/\x1b\]0;[^\x07]*\x07//'
+  if command -v oh-my-posh >/dev/null; then
+    # sed drops the terminal-title escape
+    printf '%s' "$input" \
+      | oh-my-posh claude --config "$OMP_CONFIG" \
+      | sed -E 's/\x1b\]0;[^\x07]*\x07//'
+  else
+    jq -r --arg crumb "$CCT_CRUMB" '
+      [$crumb, .model.display_name // empty]
+      | map(select(. != ""))
+      | join(" | ")' <<<"$input"
+  fi
 }
 
 ancestors() { # transcript -> ancestor ids, nearest first
@@ -746,6 +770,10 @@ cmd_selftest() {
     fi
   }
 
+  check "need reports missing" \
+    "$(need jq cct-no-such-tool 2>&1)" \
+    "cct: missing required tools: cct-no-such-tool"
+
   # Merge targets: A is a root; B is an older root with children B1 and B2.
   local pick=$CCT_PROJECTS/-x-pick
   mkdir -p "$pick"
@@ -851,6 +879,12 @@ cmd_selftest() {
     return 1
   fi
 }
+
+case ${1:-} in
+  '') need jq claude fzf ;;
+  summary) need jq claude ;;
+  *) need jq ;;
+esac
 
 case ${1:-} in
   '') cmd_pick ;;

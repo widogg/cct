@@ -36,7 +36,7 @@ cct adds the missing half:
 
 ## Requirements
 
-`bash`, `jq`, `fzf` ≥ 0.74, `claude`. Optional: `oh-my-posh` for the breadcrumb.
+`bash`, `jq`, `fzf` ≥ 0.74, `claude`; `cct` checks for them on start. Optional: `oh-my-posh`.
 
 ## Install
 
@@ -52,8 +52,8 @@ claude plugin install cct-threads@cct
 ```
 
 Statusline breadcrumb: set `"statusLine": {"type": "command", "command": "cct statusline"}` in
-`~/.claude/settings.json`. It runs `oh-my-posh claude` with `CCT_CRUMB` set; prefix the claude
-segment template with:
+`~/.claude/settings.json`. Without `oh-my-posh` it prints `breadcrumb | model`; with it, it runs
+`oh-my-posh claude` with `CCT_CRUMB` set, so prefix the claude segment template with:
 
 ```
 {{ if .Env.CCT_CRUMB }}{{ .Env.CCT_CRUMB }} | {{ end }}
