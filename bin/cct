@@ -1,0 +1,889 @@
+#!/usr/bin/env bash
+# cct: Claude Code conversation tree. Personal tool: reads ~/.claude/projects, writes only ~/.claude/threads.
+# Parses Claude Code's internal jsonl (forkedFrom, custom-title, ai-title); `cct selftest` catches format drift.
+set -u
+
+PROJECTS=${CCT_PROJECTS:-$HOME/.claude/projects}
+THREADS=${CCT_THREADS:-$HOME/.claude/threads}
+NEXT=$THREADS/.next
+OMP_CONFIG=${CCT_OMP_CONFIG:-$HOME/.config/oh-my-posh/base.yaml}
+
+die() {
+  echo "cct: $*" >&2
+  exit 1
+}
+
+# Claude keys a project by its launch dir with every non-alnum char turned into '-'.
+key_of() {
+  local dir=$1
+  echo "$PROJECTS/${dir//[^a-zA-Z0-9]/-}"
+}
+
+# Prints the dir Claude must be launched from for $1's sessions (the dir itself, else its git root).
+launch_dir() {
+  local dir=$1 git_root
+
+  if [[ ! -d $(key_of "$dir") ]] \
+    && git_root=$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null); then
+    echo "$git_root"
+  else
+    echo "$dir"
+  fi
+}
+
+transcript() { # session id -> its jsonl path
+  local session_id=$1 file
+
+  for file in "$PROJECTS"/*/"$session_id".jsonl; do
+    if [[ -f $file ]]; then
+      echo "$file"
+      return 0
+    fi
+  done
+  return 1
+}
+
+short_title() { # session id, width -> its title cut to width
+  title_of "$(transcript "$1")" | cut -c1-"$2"
+}
+
+# /branch tags each copied row with the immediate parent; `claude -r --fork-session` does not,
+# so cct's own forks record the parent in _links/<id>.
+parent_of() { # transcript -> parent session id, empty for a root
+  local file=$1 parent
+  local session_id=${file##*/}
+  session_id=${session_id%.jsonl}
+
+  parent=$(
+    grep -m1 -o '"forkedFrom":{"sessionId":"[^"]*"' "$file" \
+    | cut -d'"' -f6
+  )
+  [[ -n $parent ]] || parent=$(cat "$THREADS/_links/$session_id" 2>/dev/null)
+  echo "$parent"
+}
+
+fork() { # session id: starts a fork of it with a pinned session id, so its parent is known
+  local parent=$1 new_id
+  new_id=$(cat /proc/sys/kernel/random/uuid)
+
+  mkdir -p "$THREADS/_links" \
+    && echo "$parent" >"$THREADS/_links/$new_id" \
+    && claude -r "$parent" --fork-session --session-id "$new_id"
+}
+
+# transcript [parent transcript]: first typed prompt, skipping rows copied from the parent.
+# Copies keep their uuid; /branch copies are also tagged forkedFrom.
+first_prompt() {
+  local file=$1 parent_file=${2:-} copied_uuids=
+
+  if [[ -f $parent_file ]]; then
+    copied_uuids=$(
+      grep '"type":"user"' "$parent_file" \
+      | grep -o '"uuid":"[^"]*"'
+    )
+  fi
+
+  grep '"type":"user"' "$file" \
+    | grep -v '"isMeta":true' \
+    | { if [[ -n $parent_file ]]; then grep -v '"forkedFrom"'; else cat; fi; } \
+    | { if [[ -n $copied_uuids ]]; then grep -v -F "$copied_uuids"; else cat; fi; } \
+    | jq -jn '
+        first(inputs | .message.content | strings | select(startswith("<") | not))
+        | gsub("\\s+"; " ")[0:80]' 2>/dev/null
+}
+
+title_of() { # transcript -> display title
+  local file=$1 title parent
+
+  title=$(
+    grep '"type":"custom-title"' "$file" \
+    | tail -n1 \
+    | jq -r '.customTitle // empty' 2>/dev/null
+  )
+
+  # Forks get an auto "<parent title> (Branch N)" name; their first own prompt says more.
+  if [[ -n $title && ! $title =~ \(Branch( [0-9]+)?\)$ ]]; then
+    echo "$title"
+    return
+  fi
+
+  parent=$(parent_of "$file")
+  if [[ -n $parent ]]; then
+    title=$(first_prompt "$file" "${file%/*}/$parent.jsonl")
+    [[ -n $title ]] || title=$(first_prompt "$file" "$(transcript "$parent")")
+  else
+    title=$(
+      grep '"type":"ai-title"' "$file" \
+      | tail -n1 \
+      | jq -r '.aiTitle // empty' 2>/dev/null
+    )
+    [[ -n $title ]] || title=$(first_prompt "$file")
+  fi
+
+  echo "${title:-(untitled)}" | tr '\t' ' '
+}
+
+status_of() { # session id -> merging|receiving|merged|dropped|open
+  local session_id=$1 summary_file
+
+  # .merging/<source> holds its target id
+  if [[ -e $THREADS/.merging/$session_id ]]; then
+    echo merging
+    return
+  fi
+  if grep -qsxF "$session_id" "$THREADS"/.merging/*; then
+    echo receiving
+    return
+  fi
+
+  for summary_file in "$THREADS"/*/"$session_id".md; do
+    if [[ -f $summary_file ]]; then
+      sed -n 's/^status: //p' "$summary_file" | head -n1
+      return
+    fi
+  done
+  echo open
+}
+
+# TSV per session: id parent mtime status title. Skips sessions with no prompt.
+meta() {
+  local project_dir=$1 file session_id
+
+  for file in "$project_dir"/*.jsonl; do
+    [[ -f $file ]] && grep -q '"type":"user"' "$file" || continue
+
+    session_id=${file##*/}
+    session_id=${session_id%.jsonl}
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$session_id" \
+      "$(parent_of "$file")" \
+      "$(stat -c %Y "$file")" \
+      "$(status_of "$session_id")" \
+      "$(title_of "$file")"
+  done
+}
+
+# JSON array in display order: roots by latest activity in their subtree, children likewise.
+# Closed (merged/dropped) forks and their subtrees are hidden unless $2 == all. O(n^2), fine for hundreds.
+tree_json() {
+  local project_dir=$1 show=${2:-}
+
+  meta "$project_dir" \
+    | jq -Rn --arg all "$show" --argjson now "$(date +%s)" '
+        [ inputs
+          | split("\t")
+          | {id: .[0], parent: .[1], mtime: (.[2] | tonumber), status: .[3], title: .[4]}
+        ] as $raw
+        | ($raw | map(.id)) as $ids
+        | [ $raw[]
+            | if (.parent as $p | $ids | index([$p])) then . else .parent = "" end
+            | select($all == "all" or (.status | IN("open", "merging", "receiving")))
+          ] as $nodes
+
+        | def kids($id): [$nodes[] | select(.parent == $id)];
+          def latest($node): ([$node.mtime] + [kids($node.id)[] | latest(.)]) | max;
+          def sorted: sort_by(-latest(.));
+          def age:
+            ($now - .) as $s
+            | if $s < 3600 then "\($s / 60 | floor)m"
+              elif $s < 86400 then "\($s / 3600 | floor)h"
+              else "\($s / 86400 | floor)d"
+              end;
+          def branch($indent; $last; $depth; $mid; $end):
+            if $depth == 0 then "" else $indent + (if $last then $end else $mid end) end;
+          def walk($node; $indent; $last; $depth):
+            ( $node + {
+                depth: $depth,
+                age: ($node.mtime | age),
+                prefix: branch($indent; $last; $depth; "├─ "; "└─ ")
+              }
+            ),
+            ( (kids($node.id) | sorted) as $children
+              | range(0; $children | length) as $i
+              | walk(
+                  $children[$i];
+                  branch($indent; $last; $depth; "│  "; "   ");
+                  $i == ($children | length) - 1;
+                  $depth + 1
+                )
+            );
+
+        [$nodes | map(select(.parent == "")) | sorted[] | walk(.; ""; true; 0)]'
+}
+
+lines() { # project dir [all] -> fzf rows: id<TAB>drawn line
+  tree_json "$1" "${2:-}" \
+    | jq -r '
+        .[]
+        | ( if .status == "merged" then "\u001b[32m✔"
+            elif .status == "dropped" then "\u001b[31m✗"
+            elif .status == "merging" then "\u001b[38;2;229;200;144m◐"
+            elif .status == "receiving" then "\u001b[38;2;202;158;230m◎"
+            else "\u001b[36m●"
+            end
+          ) as $glyph
+        | (if .status == "open" then "" else " · " + .status end) as $status
+        | "\(.id)\t\(.prefix)\($glyph)\u001b[0m \(.title)  \u001b[2m\(.age)\($status)\u001b[0m"'
+}
+
+show() { # session id -> its last turns, for the fzf preview
+  local session_id=$1 file
+  file=$(transcript "$session_id") || die "no transcript for $session_id"
+
+  echo "$(title_of "$file")  [$session_id]"
+  echo
+  tail -n 400 "$file" \
+    | jq -r '
+        select((.type == "user" or .type == "assistant") and (.isMeta | not))
+        | ( .message.content
+            | if type == "string" then .
+              else [.[]? | select(.type == "text") | .text] | join(" ")
+              end
+          ) as $text
+        | select($text != "" and ($text | startswith("<") | not))
+        | (if .type == "user" then "▶ you" else "◀ claude" end) as $who
+        | "\($who): \($text | gsub("\\s+"; " ") | .[0:400])\n"' 2>/dev/null \
+    | tail -n 24
+}
+
+crumb_of() { # transcript -> "root › … › parent › current", empty for a root
+  local file=$1 dir=${1%/*} parent titles=() joined
+
+  crumb_title() { # transcript -> its title, cut to fit the breadcrumb
+    title_of "$1" \
+      | cut -c1-24 \
+      | sed 's/ *$//'
+  }
+
+  titles=("$(crumb_title "$file")")
+  while
+    parent=$(parent_of "$file")
+    [[ -n $parent ]] && ((${#titles[@]} < 20))
+  do
+    [[ -f $dir/$parent.jsonl ]] \
+      && file=$dir/$parent.jsonl \
+      || file=$(transcript "$parent") \
+      || break
+    titles=("$(crumb_title "$file")" "${titles[@]}")
+  done
+
+  ((${#titles[@]} > 1)) || return 0
+  ((${#titles[@]} > 3)) && titles=("${titles[0]}" … "${titles[@]: -2}")
+  printf -v joined '%s › ' "${titles[@]}"
+  echo "${joined% › }"
+}
+
+cmd_statusline() { # wraps oh-my-posh, passing the breadcrumb as $CCT_CRUMB
+  local input transcript_path
+  input=$(cat)
+  transcript_path=$(jq -r '.transcript_path // empty' <<<"$input" 2>/dev/null)
+
+  CCT_CRUMB=
+  [[ -f $transcript_path ]] && CCT_CRUMB=$(crumb_of "$transcript_path")
+  export CCT_CRUMB
+
+  # sed drops the terminal-title escape
+  printf '%s' "$input" \
+    | oh-my-posh claude --config "$OMP_CONFIG" \
+    | sed -E 's/\x1b\]0;[^\x07]*\x07//'
+}
+
+ancestors() { # transcript -> ancestor ids, nearest first
+  local file=$1 dir=${1%/*} parent depth=0
+
+  while
+    parent=$(parent_of "$file")
+    [[ -n $parent ]] && ((depth++ < 50))
+  do
+    echo "$parent"
+    [[ -f $dir/$parent.jsonl ]] \
+      && file=$dir/$parent.jsonl \
+      || file=$(transcript "$parent") \
+      || break
+  done
+}
+
+# project dir, ids -> the one the others merge into: the shallowest, ties to the least recently updated,
+# so a parent beats its children and between siblings or roots the newer merges into the older.
+merge_target() {
+  local project_dir=$1
+  shift
+
+  tree_json "$project_dir" all \
+    | jq -r --args '
+        [.[] | select(.id as $id | $ARGS.positional | index([$id]))]
+        | sort_by(.depth, .mtime)
+        | .[0].id // empty' "$@"
+}
+
+# id [drop] [--stay] [--into <id>], summary on stdin. Default target is the parent;
+# inside the cct loop, exiting then resumes it.
+cmd_merge() {
+  local usage='usage: cct merge <session-id> [drop] [--stay] [--into <id>] < summary'
+  local session_id=${1:?$usage}
+  local mode=merged stay= into=
+  shift
+
+  while (($#)); do
+    case $1 in
+      drop) mode=dropped ;;
+      --stay) stay=1 ;;
+      --into)
+        into=${2:?--into needs an id}
+        shift
+        ;;
+      *) die "unknown merge arg: $1" ;;
+    esac
+    shift
+  done
+
+  local file target path
+  file=$(transcript "$session_id") || die "no transcript for $session_id"
+  target=$(parent_of "$file")
+  path=$(title_of "$file")
+
+  if [[ -n $into && $into != "$target" ]]; then
+    # path: into an ancestor, the skipped generations;
+    # into another branch, the fork's chain from its root
+    [[ $into != "$session_id" ]] || die "cannot merge $session_id into itself"
+
+    local own_ancestors into_file ancestor
+    own_ancestors=$(ancestors "$file")
+    into_file=$(transcript "$into") || die "no transcript for $into"
+    ancestors "$into_file" \
+      | grep -qx "$session_id" \
+      && die "$into is a descendant of $session_id"
+
+    while read -r ancestor; do
+      [[ -n $ancestor && $ancestor != "$into" ]] || break
+      path="$(title_of "$(transcript "$ancestor")") › $path"
+    done <<<"$own_ancestors"
+    target=$into
+  fi
+
+  # A dropped root has no parent to report to; it is filed under _roots so the tree hides it.
+  [[ -n $target || $mode == dropped ]] \
+    || die "root session, nothing to merge into"
+  target=${target:-_roots}
+
+  local summary dest tmp
+  summary=$(cat)
+  [[ -n ${summary//[[:space:]]/} ]] || die "empty summary on stdin"
+
+  mkdir -p "$THREADS/$target" || die "cannot create $THREADS/$target"
+  dest=$THREADS/$target/$session_id.md
+  tmp=$(mktemp "$dest.XXXX") || die "cannot write $dest"
+  printf -- '---\nstatus: %s\nfork: %s\ntitle: %s\npath: %s\ndate: %s\n---\n%s\n' \
+    "$mode" "$session_id" "$(title_of "$file")" "$path" "$(date -Iseconds)" "$summary" >"$tmp" \
+    && mv "$tmp" "$dest" \
+    || die "cannot write $dest"
+  rm -f "$THREADS/$target/$session_id.delivered"
+
+  [[ -n ${CCT_LOOP:-} && -z $stay && $target != _roots ]] \
+    && echo "$target" >"$NEXT"
+
+  local target_file target_label=$target
+  target_file=$(transcript "$target") \
+    && target_label="$(title_of "$target_file") [$target]"
+  echo "$mode into $target_label"
+}
+
+cmd_inbox() { # session id [--ack]: prints undelivered summaries; --ack marks them delivered
+  local session_id=$1 ack=${2:-} summary_file path sorted printed_header=
+
+  # Sorted by path, so nested merges read parent-first.
+  sorted=$(
+    for summary_file in "$THREADS/$session_id"/*.md; do
+      [[ -f $summary_file ]] || continue
+      path=$(sed -n 's/^path: //p' "$summary_file" | head -n1)
+      printf '%s\t%s\n' "$path" "$summary_file"
+    done \
+    | sort \
+    | cut -f2-
+  )
+
+  while read -r summary_file; do
+    [[ -f $summary_file && ! -e ${summary_file%.md}.delivered ]] || continue
+
+    if [[ $ack == --ack ]]; then
+      touch "${summary_file%.md}.delivered"
+      continue
+    fi
+
+    if [[ -z $printed_header ]]; then
+      echo "Sub-conversations forked from this one were closed while you were away:"
+      printed_header=1
+    fi
+
+    # Front matter becomes one "### path (status date, fork id)" heading; the body follows as is.
+    awk '
+      NR == 1 && /^---$/ { in_front = 1; next }
+      in_front && /^---$/ { in_front = 0; next }
+      in_front {
+        split($0, kv, ": ")
+        meta[kv[1]] = substr($0, length(kv[1]) + 3)
+        next
+      }
+      !heading {
+        name = meta["path"] != "" ? meta["path"] : meta["title"]
+        printf "\n### %s (%s %s, fork %s)\n", name, meta["status"], meta["date"], meta["fork"]
+        heading = 1
+      }
+      { print }' "$summary_file"
+  done <<<"$sorted"
+}
+
+SUMMARY_PROMPT='This conversation is a fork that is being closed as done.
+Write a summary for the parent conversation, at most 20 lines, no preamble, exactly these headings:
+**Outcome:** what was decided or achieved
+**Decisions:** each choice made, with a one-line reason
+**Files:** paths created or changed, or "none"
+**Open:** what is still unresolved, or "none"'
+
+# session id [drop]: summary from a forked, unpersisted headless run; session and tree stay untouched
+cmd_summary() {
+  local session_id=$1 prompt=$SUMMARY_PROMPT reply
+
+  if [[ ${2:-} == drop ]]; then
+    prompt=${prompt/closed as done/closed as abandoned}
+    prompt=${prompt/what was decided or achieved/why it was abandoned}
+  fi
+
+  if ! reply=$(
+    claude -p -r "$session_id" --fork-session --no-session-persistence \
+      --model "${CCT_SUMMARY_MODEL:-sonnet}" "$prompt" </dev/null 2>&1
+  ); then
+    echo "$reply" >&2
+    return 1
+  fi
+
+  # Global rules may prepend a marker line ("Brief response"); keep from the first heading on.
+  [[ $reply == *'**Outcome:**'* ]] \
+    && reply="**Outcome:**${reply#*'**Outcome:**'}"
+  printf '%s\n' "$reply"
+}
+
+# fzf picker events -> fzf actions, printed without a newline so callers can append "+action".
+# Rename/drop ask via fzf's query line (mode in $THREADS/.pick as "mode<TAB>id"); merges run in
+# the background, marked by $THREADS/.merging/<id>; results show as the footer label.
+cmd_ui() {
+  local event=$1 arg=${2:-}
+  local state_file=$THREADS/.pick mode= mode_id= file= title= result
+
+  [[ -f $state_file ]] && IFS=$'\t' read -r mode mode_id <"$state_file"
+  if [[ $event != merged && -n $arg ]] \
+    && file=$(transcript "$arg"); then
+    title=$(title_of "$file" | cut -c1-50)
+  fi
+
+  local show_all reload
+  show_all=$(cat "$THREADS/.pick-all" 2>/dev/null)
+  reload="reload(cct lines '$CCT_DIR' $show_all)"
+
+  label() { # fzf can't take ( ) inside the action argument
+    local text=${1//(/[}
+    printf 'change-footer-label( %s )' "${text//)/]}"
+  }
+  back_to_normal() { # message
+    rm -f "$state_file"
+    printf 'change-prompt(%s)+clear-query+enable-search+%s+%s' \
+      "$CCT_PROMPT" "$reload" "$(label "$1")"
+  }
+  ask() { # mode, hint: the query line becomes the input for mode
+    printf '%s\t%s\n' "$1" "$arg" >"$state_file"
+    printf 'disable-search+change-prompt(%s › )+%s' "$1" "$(label "$2")"
+  }
+
+  # Selected ids (fzf's {+1}; the highlighted one when nothing is selected) -> background merge.
+  # Several: all go into merge_target's pick; one: into its parent.
+  merge_selected() {
+    local selected=("$@") target sources=() id
+
+    ((${FZF_SELECT_COUNT:-0} > 0)) || selected=("$arg")
+
+    if ((${#selected[@]} == 1)); then
+      target=$(parent_of "$(transcript "${selected[0]}")")
+      if [[ -z $target ]]; then
+        label "✗ root conversation: nothing to merge into (ctrl-d drops it)"
+        return
+      fi
+    else
+      target=$(merge_target "$(key_of "$CCT_DIR")" "${selected[@]}")
+      if [[ -z $target ]]; then
+        label "✗ selected chats not found"
+        return
+      fi
+    fi
+
+    for id in "${selected[@]}"; do
+      [[ -n $id && $id != "$target" ]] || continue
+      if [[ -e $THREADS/.merging/$id ]]; then
+        label "◐ \"$(short_title "$id" 40)\" is already merging"
+        return
+      fi
+      sources+=("$id")
+    done
+
+    mkdir -p "$THREADS/.merging"
+    for id in "${sources[@]}"; do
+      echo "$target" >"$THREADS/.merging/$id"
+    done
+
+    back_to_normal "◐ merging ${#sources[@]} into \"$(short_title "$target" 40)\"…"
+    printf '+clear-selection+bg-transform(cct ui merged %s %s)' \
+      "$target" "${sources[*]}"
+  }
+
+  case $event in
+    rename)
+      if [[ -n $file ]]; then
+        ask rename "enter: save  esc: cancel"
+        printf '+change-query:%s' "$(title_of "$file")"
+      fi
+      ;;
+
+    drop)
+      if [[ -n $file ]]; then
+        ask drop "reason, optional · enter: drop \"$title\"  esc: cancel"
+        printf '+clear-query'
+      fi
+      ;;
+
+    merge)
+      if [[ $mode != merge ]]; then
+        printf 'merge\t\n' >"$state_file"
+        printf 'change-prompt(merge › )+%s' \
+          "$(label "space/tab: select  ⏎: merge  esc: cancel")"
+      fi
+      ;;
+
+    select) # arg is the key; tab/space/shift-tab select only in merge mode, space types elsewhere
+      if [[ $mode == merge ]]; then
+        [[ $arg == btab ]] && echo 'toggle+up' || echo 'toggle+down'
+      elif [[ $arg == space ]]; then
+        echo 'put: '
+      fi
+      ;;
+
+    merged) # background, arg is the target: one forked, unpersisted summary per source, in parallel
+      local target=$arg id exit_code merged_count=0 failed=() tmp_dir
+      shift 2
+      tmp_dir=$(mktemp -d)
+
+      for id in "$@"; do
+        (
+          cmd_summary "$id" >"$tmp_dir/$id" 2>&1
+          echo $? >"$tmp_dir/$id.rc"
+        ) &
+      done
+      wait
+
+      for id in "$@"; do
+        exit_code=$(<"$tmp_dir/$id.rc")
+        if ((exit_code == 0)) \
+          && cmd_merge "$id" --stay --into "$target" <"$tmp_dir/$id" >/dev/null 2>&1; then
+          merged_count=$((merged_count + 1))
+        else
+          failed+=("$(short_title "$id" 30)")
+        fi
+        rm -f "$THREADS/.merging/$id"
+      done
+      rm -rf "$tmp_dir"
+
+      result="merged $merged_count into \"$(short_title "$target" 50)\""
+      if ((${#failed[@]} > 0)); then
+        result="✗ $result, failed: $(IFS=,; echo "${failed[*]}")"
+      else
+        result="✔ $result"
+      fi
+      printf '%s+%s' "$reload" "$(label "$result")"
+      ;;
+
+    enter) # arg is the highlighted id, $3 the query, the rest the selected ids
+      local query=${3:-} mode_title=
+      [[ -n $mode_id ]] && mode_title=$(short_title "$mode_id" 50)
+
+      case $mode in
+        '')
+          echo accept
+          ;;
+        merge)
+          merge_selected "${@:4}"
+          ;;
+        rename)
+          result=$(cmd_rename "$mode_id" "$query" 2>&1) \
+            && back_to_normal "✔ renamed to \"$query\"" \
+            || back_to_normal "✗ $result"
+          ;;
+        drop)
+          local reason=${query:-Dropped from the cct picker, no summary.}
+          result=$(
+            printf '%s\n' "$reason" \
+            | cmd_merge "$mode_id" drop --stay 2>&1
+          ) \
+            && back_to_normal "✔ dropped \"$mode_title\"" \
+            || back_to_normal "✗ $result"
+          ;;
+      esac
+      ;;
+
+    esc)
+      if [[ -n $mode ]]; then
+        back_to_normal "cancelled"
+        printf '+clear-selection'
+      else
+        echo abort
+      fi
+      ;;
+
+    all) # arg is on|off
+      if [[ $arg == on ]]; then
+        echo all >"$THREADS/.pick-all"
+        show_all=all
+        result="showing closed"
+      else
+        rm -f "$THREADS/.pick-all"
+        show_all=
+        result="hiding closed"
+      fi
+      reload="reload(cct lines '$CCT_DIR' $show_all)"
+      printf '%s+%s' "$reload" "$(label "$result")"
+      ;;
+  esac
+}
+
+cmd_rename() { # session id [name]: appends the title records Claude's own /rename writes
+  local session_id=$1 name=${2:-} file
+  file=$(transcript "$session_id") || die "no transcript for $session_id"
+  [[ -n ${name//[[:space:]]/} ]] || die "empty name"
+
+  jq -nc --arg name "$name" --arg id "$session_id" '
+    {type: "custom-title", customTitle: $name, sessionId: $id},
+    {type: "agent-name", agentName: $name, sessionId: $id}' >>"$file" \
+    || die "cannot write $file"
+}
+
+cmd_pick() {
+  local dir output key session_id
+  dir=$(launch_dir "$PWD")
+  cd "$dir" || die "cannot cd to $dir"
+
+  # Markers left by a picker that exited mid-merge are stale.
+  mkdir -p "$THREADS"
+  rm -rf "$THREADS/.pick-all" "$THREADS/.merging"
+  export CCT_LOOP=1 CCT_DIR=$dir CCT_PROMPT="${dir/#$HOME/\~} › "
+
+  local footer=$'⏎: resume  ^f: fork  ^n: new  ^r: rename  esc: quit\n'
+  footer+='^e: merge  ^d: drop  ^a: show closed  ^h: hide closed'
+  local fzf_args=(
+    --ansi --multi --no-sort --layout=reverse
+    --color='marker:#e5c890:bold,selected-fg:#e5c890:bold'
+    --delimiter='\t' --with-nth=2
+    --prompt="$CCT_PROMPT"
+    --footer="$footer"
+    --footer-border=line
+    --expect=ctrl-f,ctrl-n
+    --preview='cct show {1}' --preview-window=right,45%,wrap
+    --bind='enter:transform(cct ui enter {1} {q} {+1})'
+    --bind='esc:transform(cct ui esc)'
+    --bind='tab:transform(cct ui select tab)'
+    --bind='btab:transform(cct ui select btab)'
+    --bind='space:transform(cct ui select space)'
+    --bind='ctrl-a:transform(cct ui all on)'
+    --bind='ctrl-h:transform(cct ui all off)'
+    --bind='ctrl-e:transform(cct ui merge {1})'
+    --bind='ctrl-d:transform(cct ui drop {1})'
+    --bind='ctrl-r:transform(cct ui rename {1})'
+  )
+
+  while :; do
+    # A merge from inside a resumed session leaves its parent here to resume next.
+    if [[ -s $NEXT ]]; then
+      session_id=$(<"$NEXT")
+      rm -f "$NEXT"
+      claude -r "$session_id"
+      continue
+    fi
+
+    rm -f "$THREADS/.pick"
+    output=$(
+      lines "$(key_of "$dir")" "$(cat "$THREADS/.pick-all" 2>/dev/null)" \
+      | fzf "${fzf_args[@]}"
+    )
+    key=$(sed -n 1p <<<"$output")
+    session_id=$(sed -n 2p <<<"$output" | cut -f1)
+
+    case $key in
+      ctrl-n) claude ;;
+      ctrl-f) [[ -n $session_id ]] && fork "$session_id" ;;
+      *)
+        [[ -n $session_id ]] || return 0
+        claude -r "$session_id"
+        ;;
+    esac
+  done
+}
+
+cmd_selftest() {
+  local tmp
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' RETURN
+
+  export CCT_PROJECTS=$tmp/projects CCT_THREADS=$tmp/threads
+  PROJECTS=$CCT_PROJECTS THREADS=$CCT_THREADS NEXT=$CCT_THREADS/.next
+
+  user_row() { # prompt [forked-from id]
+    local forked=${2:+,\"forkedFrom\":{\"sessionId\":\"$2\",\"messageUuid\":\"m\"}}
+    printf '{"type":"user","message":{"role":"user","content":"%s"}%s}\n' "$1" "$forked"
+  }
+  local fails=0
+  check() { # name, got, want
+    if [[ $2 == "$3" ]]; then
+      echo "ok   $1"
+    else
+      echo "FAIL $1: got [$2] want [$3]"
+      fails=$((fails + 1))
+    fi
+  }
+
+  # Merge targets: A is a root; B is an older root with children B1 and B2.
+  local pick=$CCT_PROJECTS/-x-pick
+  mkdir -p "$pick"
+  user_row "a" >"$pick/A.jsonl"
+  user_row "b" >"$pick/B.jsonl"
+  { user_row "b" B; user_row "b1"; } >"$pick/B1.jsonl"
+  { user_row "b" B; user_row "b2"; } >"$pick/B2.jsonl"
+  touch -d '2 days ago' "$pick/B.jsonl"
+  touch -d '1 day ago' "$pick/A.jsonl"
+  check "target ex1: other root beats a child" "$(merge_target "$pick" A B2)" "A"
+  check "target ex2: older root wins" "$(merge_target "$pick" A B)" "B"
+  check "target ex3: older root wins over all" "$(merge_target "$pick" A B B1 B2)" "B"
+  touch -d '3 hours ago' "$pick/B1.jsonl"
+  check "target siblings: older wins" "$(merge_target "$pick" B1 B2)" "B1"
+
+  # Tree: root r -> fork f -> sub-fork s.
+  local repo=$CCT_PROJECTS/-x-repo
+  mkdir -p "$repo"
+  {
+    user_row "root topic"
+    echo '{"type":"custom-title","customTitle":"Root"}'
+  } >"$repo/r.jsonl"
+  {
+    user_row "root topic" r
+    user_row "fork topic"
+    echo '{"type":"custom-title","customTitle":"Root (Branch)"}'
+  } >"$repo/f.jsonl"
+  { user_row "root topic" f; user_row "fork topic" f; user_row "sub topic"; } >"$repo/s.jsonl"
+  check "tree order" \
+    "$("$0" tree --json /x/repo | jq -r 'map("\(.depth)\(.id)") | join(" ")')" \
+    "0r 1f 2s"
+  check "fork title" "$(title_of "$repo/f.jsonl")" "fork topic"
+  check "crumb" "$(crumb_of "$repo/s.jsonl")" "Root › fork topic › sub topic"
+  check "root crumb empty" "$(crumb_of "$repo/r.jsonl")" ""
+
+  check "merge root refused" \
+    "$(echo x | "$0" merge r 2>&1)" \
+    "cct: root session, nothing to merge into"
+  echo "did the thing" | "$0" merge s >/dev/null
+  check "merged hidden" \
+    "$("$0" tree --json /x/repo | jq -r 'map(.id) | join(" ")')" \
+    "r f"
+  check "merged shown with all" \
+    "$("$0" tree --json /x/repo all | jq -r '.[2].status')" \
+    "merged"
+  check "inbox delivers" "$("$0" inbox f | grep -c 'did the thing')" "1"
+  "$0" inbox f --ack
+  check "inbox once" "$("$0" inbox f)" ""
+  echo "nope" | CCT_LOOP=1 "$0" merge f drop >/dev/null
+  check "loop handoff to parent" "$(cat "$CCT_THREADS/.next")" "r"
+  "$0" rename f "Renamed fork"
+
+  # Linked fork l: made by `cct` itself, so no forkedFrom;
+  # parent comes from _links, copied rows share uuids.
+  { user_row "root topic"; user_row "linked topic"; } >"$repo/l.jsonl"
+  sed -i 's/"type":"user"/"uuid":"u1","type":"user"/' "$repo/r.jsonl"
+  sed -i '1s/"type":"user"/"uuid":"u1","type":"user"/' "$repo/l.jsonl"
+  mkdir -p "$CCT_THREADS/_links"
+  echo r >"$CCT_THREADS/_links/l"
+  check "linked fork parent" "$(parent_of "$repo/l.jsonl")" "r"
+  check "linked fork title" "$(title_of "$repo/l.jsonl")" "linked topic"
+
+  mkdir -p "$CCT_THREADS/.merging"
+  : >"$CCT_THREADS/.merging/l"
+  check "merging shown" \
+    "$("$0" tree --json /x/repo | jq -r '.[] | select(.id == "l") | .status')" \
+    "merging"
+  rm -r "$CCT_THREADS/.merging"
+
+  { user_row "root topic" f; user_row "fork topic" f; user_row "deep topic"; } >"$repo/g.jsonl"
+  check "merge into descendant refused" \
+    "$(echo x | "$0" merge f --into g 2>&1)" \
+    "cct: g is a descendant of f"
+  echo "deep summary" | "$0" merge g --into r >/dev/null
+  check "merge into ancestor keeps path" \
+    "$(sed -n 's/^path: //p' "$CCT_THREADS/r/g.md")" \
+    "Renamed fork › deep topic"
+  { user_row "root topic" f; user_row "fork topic" f; user_row "other topic"; } >"$repo/h.jsonl"
+  echo "cross summary" | "$0" merge h --into l >/dev/null
+  check "merge across branches keeps chain" \
+    "$(sed -n 's/^path: //p' "$CCT_THREADS/l/h.md")" \
+    "Root › Renamed fork › other topic"
+
+  mkdir -p "$CCT_THREADS/.merging"
+  echo r >"$CCT_THREADS/.merging/x"
+  check "target shows receiving" "$(status_of r)" "receiving"
+  rm -r "$CCT_THREADS/.merging"
+
+  check "inbox shows path" \
+    "$("$0" inbox r | grep -c '### Renamed fork › deep topic')" \
+    "1"
+  check "rename" "$(title_of "$repo/f.jsonl")" "Renamed fork"
+  echo "gone" | "$0" merge r drop >/dev/null
+  check "root drop hides tree" "$("$0" tree --json /x/repo | jq -r 'length')" "0"
+  check "dropped status" \
+    "$("$0" tree --json /x/repo all | jq -r '.[1].status')" \
+    "dropped"
+
+  if ((fails == 0)); then
+    echo "selftest passed"
+  else
+    echo "selftest: $fails failed"
+    return 1
+  fi
+}
+
+case ${1:-} in
+  '') cmd_pick ;;
+  tree)
+    shift
+    [[ ${1:-} == --json ]] && shift
+    tree_json "$(key_of "$(launch_dir "${1:-$PWD}")")" "${2:-}"
+    ;;
+  lines) lines "$(key_of "$2")" "${3:-}" ;;
+  show) show "${2:?usage: cct show <id>}" ;;
+  crumb)
+    file=$(transcript "${2:?usage: cct crumb <id>}") && crumb_of "$file"
+    ;;
+  statusline) cmd_statusline ;;
+  merge)
+    shift
+    cmd_merge "$@"
+    ;;
+  inbox) cmd_inbox "${2:?usage: cct inbox <id> [--ack]}" "${3:-}" ;;
+  ui)
+    shift
+    cmd_ui "$@"
+    ;;
+  summary) cmd_summary "${2:?usage: cct summary <id> [drop]}" "${3:-}" ;;
+  rename) cmd_rename "${2:?usage: cct rename <id> [name]}" "${3:-}" ;;
+  next) mkdir -p "$THREADS" && echo "${2:?usage: cct next <id>}" >"$NEXT" ;;
+  selftest) cmd_selftest ;;
+  *)
+    cat >&2 <<'EOF'
+usage: cct [tree [--json] [dir] [all] | show <id> | crumb <id> | statusline
+  | merge <id> [drop] [--stay] [--into <id>] | rename <id> [name]
+  | summary <id> [drop] | inbox <id> [--ack] | next <id> | selftest]
+EOF
+    exit 2
+    ;;
+esac
