@@ -1,0 +1,9 @@
+{
+  "name": "cct-threads",
+  "version": "0.1.0",
+  "description": "Conversation tree for forked Claude sessions: breadcrumb band, tree pane, jump, merge/drop. Backed by the cct script.",
+  "types": "./types/index.d.ts",
+  "author": {
+    "name": "guidog"
+  }
+}

@@ -1,0 +1,16 @@
+{
+  "name": "cct",
+  "owner": {
+    "name": "widogg"
+  },
+  "plugins": [
+    {
+      "name": "cct-threads",
+      "source": "./cct-threads",
+      "description": "Conversation tree for forked Claude sessions"
+    }
+  ],
+  "metadata": {
+    "description": "Conversation tree for forked Claude Code sessions"
+  }
+}
